@@ -205,6 +205,28 @@ def test_an_mla_layer_without_the_output_gate_is_refused(monkeypatch):
     assert any("output gate" in r for r in reasons), reasons
 
 
+def test_a4w4_experts_are_the_plain_layout(monkeypatch):
+    # Under AITER_SITUV2_A4W4, Mxfp4MoEMethod shuffles with shuffle_weight /
+    # shuffle_scale, not the a16w4 pair the launch reads with guint=False. The
+    # bytes agree for Kimi-K3's TP8 shapes; this fails if aiter changes either.
+    pytest.importorskip("aiter.ops.shuffle")
+    import torch
+
+    from sgl_amd_mono.kimi_k3.gfx950.stages.moe import LAT, RI
+
+    monkeypatch.setenv("AITER_SITUV2_A8W4", "0")
+    monkeypatch.setenv("AITER_SITUV2_A4W4", "1")
+    layer = _fake_layer()
+    layer.mlp.experts = SimpleNamespace(
+        w13_weight=torch.zeros(1, 2 * RI, LAT // 2, dtype=torch.uint8),
+        w2_weight=torch.zeros(1, LAT, RI // 2, dtype=torch.uint8),
+    )
+    layer.mlp.experts.w13_weight.is_shuffled = True
+    layer.mlp.experts.w2_weight.is_shuffled = True
+    assert k3._a4w4_layout_is_plain(layer.mlp.experts)
+    assert _reasons(monkeypatch, layer) == []
+
+
 def test_the_guard_flags_sit_past_every_width(monkeypatch):
     """Every width reads the guard flags at the same offset.
 

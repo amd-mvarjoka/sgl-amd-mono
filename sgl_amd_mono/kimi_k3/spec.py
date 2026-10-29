@@ -158,9 +158,6 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
     """What ``SPEC.requires`` cannot state: the shapes, which live on the text
     config and so are out of ``requires.hf_config``'s reach; aiter's own flags;
     and FlyDSL."""
-    from sglang.srt.layers.quantization.mxfp4 import (
-        _aiter_situ_uses_gu_interleaved_weights,
-    )
     from sglang.srt.utils.common import get_bool_env_var
 
     t = _text_config(hf_config)
@@ -188,11 +185,6 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
                 f"attn_res_block_size {block} gives layer {last} {blocks} "
                 f"attention-residual blocks, the launch is built for {MAX_BLOCKS}"
             )
-    if not _aiter_situ_uses_gu_interleaved_weights():
-        reasons.append(
-            "needs the MXFP4 experts in aiter's gate / up interleaved layout; "
-            "set AITER_SITUV2_A8W4=1 or leave AITER_SITUV2_A4W4 unset"
-        )
     if not get_bool_env_var("SGLANG_AITER_K3_OPT"):
         reasons.append("needs SGLANG_AITER_K3_OPT=1")
     if importlib.util.find_spec("flydsl") is None:
@@ -200,10 +192,56 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
     return reasons
 
 
+def _a4w4_layout_is_plain(experts) -> bool:
+    """Whether the A4W4 branch of ``Mxfp4MoEMethod`` laid these experts out in
+    the launch's plain layout (``guint=False``).
+
+    That branch shuffles with ``shuffle_weight`` / ``shuffle_scale``, the launch
+    reads ``shuffle_weight_a16w4`` / ``shuffle_scale_a16w4`` with ``gate_up=False``.
+    They are different permutations that give the same bytes for these shapes,
+    which is aiter's code and not a contract, so it is checked on one expert of
+    the loaded shapes rather than assumed.
+    """
+    from aiter.ops.shuffle import (
+        shuffle_scale,
+        shuffle_scale_a16w4,
+        shuffle_weight,
+        shuffle_weight_a16w4,
+    )
+
+    gen = torch.Generator().manual_seed(0)
+
+    def u8(*shape):
+        return torch.randint(0, 256, shape, generator=gen, dtype=torch.uint8)
+
+    for weight, gate_up in ((experts.w13_weight, True), (experts.w2_weight, False)):
+        n, k = weight.shape[1], weight.view(torch.uint8).shape[2] * 2
+        w, s = u8(1, n, k // 2), u8(n, k // 32)
+        try:
+            a4w4_w = shuffle_weight(w, is_guinterleave=False, gate_up=gate_up)
+            a4w4_s = shuffle_scale(
+                s, experts_cnt=1, is_guinterleave=False, gate_up=gate_up
+            )
+            plain_w = shuffle_weight_a16w4(w, 16, False)
+            plain_s = shuffle_scale_a16w4(s, 1, False)
+        except (AssertionError, RuntimeError, ValueError):
+            return False  # a shape one of the shuffles does not tile
+        if not (
+            torch.equal(a4w4_w.view(torch.uint8), plain_w.view(torch.uint8))
+            and a4w4_s.shape == plain_s.shape
+            and torch.equal(a4w4_s.view(torch.uint8), plain_s.view(torch.uint8))
+        ):
+            return False
+    return True
+
+
 def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
     """Every per-layer check the config cannot answer. The kernels read each
     weight as a raw address, so a wrong dtype, shape or layout is read as if it
     were the expected one."""
+    from sglang.srt.layers.quantization.mxfp4 import (
+        _aiter_situ_uses_gu_interleaved_weights,
+    )
     from sglang.srt.utils.common import require_mlp_sync
 
     hidden = HF_CONFIG["hidden_size"]
@@ -269,6 +307,16 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
         reasons += [f"layer {i}: {why}" for ok, why in checks if not ok]
         if reasons and i > covered[0]:
             break  # one layer's reasons say it for all
+    experts = getattr(layers[covered[0]].mlp, "experts", None) if covered else None
+    if (
+        experts is not None
+        and not _aiter_situ_uses_gu_interleaved_weights()
+        and not _a4w4_layout_is_plain(experts)
+    ):
+        reasons.append(
+            "the MXFP4 experts are not in the plain A16W4 layout the launch reads "
+            "with gate / up separated; set AITER_SITUV2_A8W4=1"
+        )
     return reasons
 
 
