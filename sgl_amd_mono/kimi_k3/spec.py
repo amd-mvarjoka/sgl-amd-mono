@@ -334,10 +334,11 @@ def _build(model, hf_config, ctx):
     runner = K3MonoRunner(p.tp_size, p.tp_rank, p.tp_group.cpu_group, device)
     runner.set_deadline(ctx.deadline_s)
     state_dtype = k1_mod.ssm_dtype(hf_config)
+    ring = k1_mod.replayssm_spec()
     layers, batches = {}, {}
     for rows in ctx.widths:
         for i in _covered_layers(hf_config):
-            packed = _weights(backbone.layers[i], i, rows, runner, state_dtype)
+            packed = _weights(backbone.layers[i], i, rows, runner, state_dtype, ring)
             layers.setdefault(rows, {})[i] = packed
         # FlyDSL compiles a launcher on its first call, and the first real call
         # is inside a CUDA graph capture, where compiling aborts the process.
@@ -440,6 +441,19 @@ NUMERICS = Numerics(
         # k1.core's bf16-rounding bounds.
         "k1.ssm_bf16.cosine": 0.99999,
         "k1.ssm_bf16.rel": 0.004,
+        # Under --enable-linear-replayssm-spec, the ReplaySSM ring in place of
+        # the state: the conv's v and k, the gate and beta of each token, which
+        # SGLang's commit folds into the state. Elementwise on both sides but
+        # for the gate's f_b GEMM, which sums in another order. Not measured
+        # yet: provisional, at k1.core's bf16-rounding bounds.
+        "k1.ring_v.cosine": 0.99999,
+        "k1.ring_v.rel": 0.004,
+        "k1.ring_k.cosine": 0.99999,
+        "k1.ring_k.rel": 0.004,
+        "k1.ring_g.cosine": 0.99999,
+        "k1.ring_g.rel": 0.004,
+        "k1.ring_beta.cosine": 0.99999,
+        "k1.ring_beta.rel": 0.004,
         # The conv window handed back to SGLang's speculative state, which the
         # accept-time commit reads. Nothing in the serving path reports a wrong
         # one: it shows up as a lower acceptance length and a GSM8K score a few
@@ -501,7 +515,7 @@ def _k2_blocks(layer) -> int:
     return layer.prev_valid_blocks + int(layer.is_block_write_layer)
 
 
-def _weights(layer, i: int, rows: int, runner, state_dtype) -> _Layer:
+def _weights(layer, i: int, rows: int, runner, state_dtype, ring) -> _Layer:
     """This layer's build key at one launch width. The weights themselves are
     read in place at launch, so nothing is packed or copied here."""
     from sgl_amd_mono.kimi_k3.gfx950 import k1 as k1_mod
@@ -509,7 +523,7 @@ def _weights(layer, i: int, rows: int, runner, state_dtype) -> _Layer:
 
     moe = layer.mlp
     return _Layer(
-        k1=k1_mod.build(layer, i, rows, state_dtype),
+        k1=k1_mod.build(layer, i, rows, state_dtype, ring),
         i=i,
         key=K2Build(
             tokens=rows,

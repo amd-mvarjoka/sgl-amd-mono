@@ -106,6 +106,10 @@ def test_the_bounds_name_the_launches_and_their_outputs():
         "moe.out.cosine",
         "k1.ssm.cosine",
         "k1.ssm_bf16.cosine",
+        "k1.ring_v.cosine",
+        "k1.ring_k.cosine",
+        "k1.ring_g.cosine",
+        "k1.ring_beta.cosine",
     ):
         assert 0.0 < k3.SPEC.numerics.bound(name) <= 1.0
     with pytest.raises(KeyError):
@@ -134,6 +138,56 @@ def test_k1_builds_for_the_ssm_pools_dtype():
     assert k1._unsupported_reasons(layer, torch.bfloat16) == []
     reasons = k1._unsupported_reasons(layer, torch.float16)
     assert any("--mamba-ssm-dtype" in r for r in reasons), reasons
+
+
+def test_k1_takes_the_replayssm_ring_only_in_its_ring_build():
+    """Under --enable-linear-replayssm-spec the pool has the ReplaySSM rings and
+    no intermediate_ssm. The ring build takes a step only with rings of the
+    layout it writes and long enough for the step; the snapshot build never."""
+    pytest.importorskip("flydsl")
+    pytest.importorskip("aiter")
+    import torch
+
+    from sgl_amd_mono.kimi_k3.gfx950 import k1
+    from sgl_amd_mono.kimi_k3.gfx950.attention import kda
+
+    qlen, layers, slots = 6, 2, 3
+
+    def batch(ring):
+        key = kda.KdaPreBuild(
+            tokens=qlen,
+            qlen=qlen,
+            nblocks=1,
+            delta=False,
+            state_len=qlen + kda.CONV_W - 1,
+            ring=ring,
+        )
+        return SimpleNamespace(layers=[SimpleNamespace(key=key)])
+
+    def step(ring_len=16, g_dtype=torch.float32):
+        head = (layers, slots, kda.NH, ring_len)
+        return {
+            "rows": torch.zeros(1, dtype=torch.long),
+            "slots": torch.zeros(1, dtype=torch.int32),
+            "num_draft": qlen,
+            "ring": True,
+            "inter_ssm": None,
+            "rings": (
+                torch.empty(*head, kda.HD, dtype=torch.bfloat16),
+                torch.empty(*head, kda.HD, dtype=torch.bfloat16),
+                torch.empty(*head, kda.HD, dtype=g_dtype),
+                torch.empty(*head, dtype=torch.float32),
+            ),
+            "committed_ssm": torch.empty(layers, slots, kda.NH, kda.HD, kda.HD),
+            "committed_conv": torch.empty(
+                layers, slots, kda.CONV_W - 1, 3 * kda.PROJ, dtype=torch.bfloat16
+            ),
+        }
+
+    assert k1._step_shapes_ok(batch(True), step())
+    assert not k1._step_shapes_ok(batch(False), step())
+    assert not k1._step_shapes_ok(batch(True), step(ring_len=qlen - 1))
+    assert not k1._step_shapes_ok(batch(True), step(g_dtype=torch.bfloat16))
 
 
 def test_the_build_needs_a_real_model():
