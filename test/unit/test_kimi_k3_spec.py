@@ -99,10 +99,41 @@ def test_a_block_size_past_the_launch_is_refused():
 
 
 def test_the_bounds_name_the_launches_and_their_outputs():
-    for name in ("k2.prefix.cosine", "k2.x.cosine", "k2.out.cosine", "moe.out.cosine"):
+    for name in (
+        "k2.prefix.cosine",
+        "k2.x.cosine",
+        "k2.out.cosine",
+        "moe.out.cosine",
+        "k1.ssm.cosine",
+        "k1.ssm_bf16.cosine",
+    ):
         assert 0.0 < k3.SPEC.numerics.bound(name) <= 1.0
     with pytest.raises(KeyError):
         k3.SPEC.numerics.bound("k2.nothing.cosine")
+
+
+def test_k1_builds_for_the_ssm_pools_dtype():
+    """K1 reads and writes SGLang's SSM pool in place, so its build has to take
+    the dtype the pool was allocated in: bf16 or fp32, and nothing else."""
+    import torch
+
+    from sgl_amd_mono.kimi_k3.gfx950 import k1
+
+    for dtype in (torch.float32, torch.bfloat16):
+        params = SimpleNamespace(dtype=SimpleNamespace(temporal=dtype))
+        text = SimpleNamespace(mamba2_cache_params=params)
+        assert k1.ssm_dtype(SimpleNamespace(text_config=text)) is dtype
+    layer = SimpleNamespace(
+        self_attn=SimpleNamespace(
+            use_full_rank_gate=True,
+            _qkvgbfa_layer=object(),
+            qkv_conv1d=SimpleNamespace(weight=torch.zeros(4, 1, 4)),
+        )
+    )
+    assert k1._unsupported_reasons(layer, torch.float32) == []
+    assert k1._unsupported_reasons(layer, torch.bfloat16) == []
+    reasons = k1._unsupported_reasons(layer, torch.float16)
+    assert any("--mamba-ssm-dtype" in r for r in reasons), reasons
 
 
 def test_the_build_needs_a_real_model():

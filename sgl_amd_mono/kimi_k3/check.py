@@ -52,8 +52,10 @@ def _kda_slices(built, packed):
     st = built._k1_state
     mi = packed.k1.mamba_idx
     row = st["row"]
+    # A bf16 state is scored against its own bound: it rounds once a store.
+    ssm = "ssm_bf16" if packed.k1.key.state_bf16 else "ssm"
     pairs = [
-        ("ssm", st.get("inter_ssm"), (mi, row)),
+        (ssm, st.get("inter_ssm"), (mi, row)),
         ("window", st.get("inter_window"), (mi, row)),
     ]
     return [(n, t, idx) for n, t, idx in pairs if t is not None]

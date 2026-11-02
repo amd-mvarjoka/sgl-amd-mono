@@ -285,10 +285,11 @@ def _build(model, hf_config, ctx):
     # the peer handshake is collective: every rank reaches it here
     runner = K3MonoRunner(p.tp_size, p.tp_rank, p.tp_group.cpu_group, device)
     runner.set_deadline(ctx.deadline_s)
+    state_dtype = k1_mod.ssm_dtype(hf_config)
     layers, batches = {}, {}
     for rows in ctx.widths:
         for i in _covered_layers(hf_config):
-            packed = _weights(backbone.layers[i], i, rows, runner)
+            packed = _weights(backbone.layers[i], i, rows, runner, state_dtype)
             layers.setdefault(rows, {})[i] = packed
         # FlyDSL compiles a launcher on its first call, and the first real call
         # is inside a CUDA graph capture, where compiling aborts the process.
@@ -386,6 +387,11 @@ NUMERICS = Numerics(
         # The recurrent state staged for the step's verify rows.
         "k1.ssm.cosine": 1.0 - 1e-6,
         "k1.ssm.rel": 0.001,
+        # The same under --mamba-ssm-dtype bfloat16, where both sides round the
+        # fp32 state to bf16 once a store. Not measured yet: provisional, at
+        # k1.core's bf16-rounding bounds.
+        "k1.ssm_bf16.cosine": 0.99999,
+        "k1.ssm_bf16.rel": 0.004,
         # The conv window handed back to SGLang's speculative state, which the
         # accept-time commit reads. Nothing in the serving path reports a wrong
         # one: it shows up as a lower acceptance length and a GSM8K score a few
@@ -447,7 +453,7 @@ def _k2_blocks(layer) -> int:
     return layer.prev_valid_blocks + int(layer.is_block_write_layer)
 
 
-def _weights(layer, i: int, rows: int, runner) -> _Layer:
+def _weights(layer, i: int, rows: int, runner, state_dtype) -> _Layer:
     """This layer's build key at one launch width. The weights themselves are
     read in place at launch, so nothing is packed or copied here."""
     from sgl_amd_mono.kimi_k3.gfx950 import k1 as k1_mod
@@ -455,7 +461,7 @@ def _weights(layer, i: int, rows: int, runner) -> _Layer:
 
     moe = layer.mlp
     return _Layer(
-        k1=k1_mod.build(layer, i, rows),
+        k1=k1_mod.build(layer, i, rows, state_dtype),
         i=i,
         key=K2Build(
             tokens=rows,

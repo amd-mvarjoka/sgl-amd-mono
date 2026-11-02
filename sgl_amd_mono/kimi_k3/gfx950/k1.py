@@ -81,6 +81,9 @@ SGLANG_READS = {
         "intermediate_conv_window",
     ),
     "srt/layers/attention/mamba/mamba2_metadata.py": ("mamba_cache_indices",),
+    # the SSM state dtype the pool is allocated in, which picks K1's build
+    "srt/configs/kimi_linear.py": ("mamba2_cache_params",),
+    "srt/configs/mamba_utils.py": ("dtype", "temporal"),
     # the kernel writes the bank row; this is the count that goes with it
     "srt/layers/attn_residual.py": ("_count_write", "num_valid_blocks"),
     # this layer's weights, read in place at launch
@@ -135,10 +138,23 @@ def _is_kda_layer(layer) -> bool:
     return hasattr(layer.self_attn, "qkv_conv1d")
 
 
-def _unsupported_reasons(layer) -> list[str]:
+def ssm_dtype(hf_config) -> torch.dtype:
+    """The dtype SGLang allocates the KDA state pools in: --mamba-ssm-dtype,
+    else the model config, else fp32. K1 reads and writes that pool in place,
+    so its build follows it."""
+    t = getattr(hf_config, "text_config", None) or hf_config
+    return t.mamba2_cache_params.dtype.temporal
+
+
+def _unsupported_reasons(layer, state_dtype: torch.dtype) -> list[str]:
     """Why K1 cannot take this layer, fail-loud at build rather than per step."""
     attn = layer.self_attn
     reasons = []
+    if state_dtype not in (torch.float32, torch.bfloat16):
+        reasons.append(
+            f"the SSM state is {state_dtype}; K1 has builds for float32 and "
+            "bfloat16 (--mamba-ssm-dtype)"
+        )
     # w_in is the merged [q,k,v,g | f_a | b | pad] buffer. Without the merge
     # there is no single tensor in K1's in-projection layout, and the pieces
     # carry their own quantization scales that a row-cat would drop.
@@ -165,15 +181,16 @@ def _unsupported_reasons(layer) -> list[str]:
     return reasons
 
 
-def build(layer, i: int, rows: int) -> Optional[K1Layer]:
+def build(layer, i: int, rows: int, state_dtype: torch.dtype) -> Optional[K1Layer]:
     """This layer's K1 build key at one launch width, or None when K1 does not
     take it. The weights are read in place; the conv row is filled in by
-    ``build_batch``, which allocates every layer's in one buffer."""
+    ``build_batch``, which allocates every layer's in one buffer.
+    ``state_dtype`` is the SSM pool's (``ssm_dtype``)."""
     from sgl_amd_mono.kimi_k3.gfx950.attention import kda
 
     if not _is_kda_layer(layer):
         return None  # a full-attention layer, not a refusal
-    reasons = _unsupported_reasons(layer)
+    reasons = _unsupported_reasons(layer, state_dtype)
     if reasons:
         # Said once: a KDA layer K1 could not take is a configuration fact the
         # log has to carry, or K1 reads as built and unhelpful.
@@ -193,6 +210,7 @@ def build(layer, i: int, rows: int) -> Optional[K1Layer]:
             onorm_eps=float(attn.o_norm.eps),
             lower_bound=float(attn.attn.lower_bound),
             write_idx=(layer.prev_valid_blocks if layer.is_block_write_layer else -1),
+            state_bf16=state_dtype == torch.bfloat16,
         ),
         module=layer,
         # The same cast SGLang's own fused KDA decode makes once at load
@@ -283,7 +301,12 @@ def warmup(runner, packed: K1Layer, prefix, blocks) -> None:
         blocks=blocks,
         **_weight_args(packed),
         rstate=torch.zeros(
-            rows, kda.NH, kda.HD, kda.HD, dtype=torch.float32, device=device
+            rows,
+            kda.NH,
+            kda.HD,
+            kda.HD,
+            dtype=kda.state_dtype(packed.key),
+            device=device,
         ),
         st_idx=torch.arange(rows, dtype=torch.int32, device=device).view(1, rows),
         num_acc=torch.ones(1, dtype=torch.int32, device=device),
@@ -398,14 +421,19 @@ def _step_shapes_ok(batch: K1Batch, st: dict) -> bool:
 
     qlen = st["num_draft"]
     key = batch.layers[0].key
+    want = kda.state_dtype(key)
     checks = [
         (st["rows"].numel() >= 1 and st["slots"].numel() >= 1, "the step has no state"),
         (0 < qlen <= MAX_ROWS, f"{qlen} drafted tokens is not 1 .. {MAX_ROWS}"),
         (qlen == key.qlen, f"{qlen} drafted tokens, built for {key.qlen}"),
         (
-            st["inter_ssm"].dtype == torch.float32 and st["inter_ssm"].shape[2] == qlen,
-            f"intermediate_ssm is {st['inter_ssm'].dtype} "
-            f"{tuple(st['inter_ssm'].shape)}",
+            st["committed_ssm"].dtype == want and st["inter_ssm"].dtype == want,
+            f"the SSM state is {st['committed_ssm'].dtype}, intermediate_ssm "
+            f"{st['inter_ssm'].dtype}; K1 was built for {want} (--mamba-ssm-dtype)",
+        ),
+        (
+            st["inter_ssm"].shape[2] == qlen,
+            f"intermediate_ssm is {tuple(st['inter_ssm'].shape)}",
         ),
         (
             st["committed_conv"].shape[-1] == 3 * kda.PROJ

@@ -131,7 +131,15 @@ def _kda_reference(case):
 class K1Case:
     """One synthetic K1 launch: its inputs, and the tensors it wrote."""
 
-    def __init__(self, device, *, num_acc, state_len=None, write_idx=-1):
+    def __init__(
+        self,
+        device,
+        *,
+        num_acc,
+        state_len=None,
+        write_idx=-1,
+        state_dtype=torch.float32,
+    ):
         from sgl_amd_mono.kimi_k3.gfx950.attention import kda
 
         self.kda = kda
@@ -143,6 +151,7 @@ class K1Case:
         self.state_len = state_len or (self.L + kda.CONV_W - 1)
         self.num_acc = num_acc
         self.write_idx = write_idx
+        self.state_dtype = state_dtype
 
         g = torch.Generator(device=device).manual_seed(5)
         s, h, dim = self.S, kda.HIDDEN, 3 * kda.PROJ
@@ -172,7 +181,7 @@ class K1Case:
         self.conv_state = full[:, :, : self.state_len].contiguous()
         self.conv_state_in = self.conv_state.clone()
         self.rstate = _randn(
-            g, nslots, kda.NH, kda.HD, kda.HD, scale=0.05, dtype=torch.float32
+            g, nslots, kda.NH, kda.HD, kda.HD, scale=0.05, dtype=state_dtype
         )
         self.rstate_in = self.rstate.clone()
 
@@ -193,6 +202,7 @@ class K1Case:
             onorm_eps=EPS,
             debug=True,
             write_idx=self.write_idx,
+            state_bf16=self.state_dtype == BF,
         )
         scratch = torch.zeros(
             kda.scratch_bytes(key), dtype=torch.uint8, device=self.device
@@ -495,6 +505,36 @@ class TestKimiK3MonoKdaPre(CustomTestCase):
             f"short state_len {short.state_len}: carry entry {win - 1} differs "
             f"(read index {acc_idx + win} does not exist), launch succeeded"
         )
+
+    def test_bf16_state_is_the_fp32_state_rounded(self):
+        """--mamba-ssm-dtype bfloat16 changes how the state is stored, not how
+        it is computed.
+
+        The recurrence runs in fp32 registers in both builds. Started from the
+        same values, a bf16 build therefore computes the same core_out, bit for
+        bit, and stores each token's state as the fp32 build's rounded to bf16.
+        """
+        fp32 = K1Case(self.device, num_acc=QLEN)
+        bf16 = K1Case(self.device, num_acc=QLEN, state_dtype=BF)
+        fp32.rstate = bf16.rstate.float()
+        fp32.rstate_in = fp32.rstate.clone()
+        fp32.run()
+        bf16.run()
+        self.assertTrue(
+            torch.equal(bf16.core_out, fp32.core_out),
+            "the state dtype changed core_out, not only the stored state",
+        )
+        slots = fp32.st_idx[0].long()
+        torch.testing.assert_close(
+            bf16.rstate[slots].float(),
+            fp32.rstate[slots].to(BF).float(),
+            rtol=2**-7,
+            atol=0.0,
+            msg="the bf16 state is not the fp32 state rounded once",
+        )
+        cos = _cos(bf16.core_out, _kda_reference(bf16))
+        print(f"bf16 state: core_out equal to fp32's, cos vs torch {cos:.6f}")
+        self.assertGreater(cos, COS_MIN, "the bf16 build differs from torch")
 
     def test_block_write_layer_snapshots_the_prefix(self):
         """write_idx >= 0 stores the updated prefix into that bank row.

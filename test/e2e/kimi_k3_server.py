@@ -11,6 +11,8 @@ MODEL = os.environ.get("KIMI_K3_MODEL_PATH", "moonshotai/Kimi-K3")
 DRAFT = os.environ.get(
     "KIMI_K3_DSPARK_MODEL_PATH", "moonshotai/RadixArk-Kimi-K3-DSpark"
 )
+# K1 has a build for either SSM state dtype; this picks the one served.
+SSM_DTYPE = os.environ.get("KIMI_K3_MAMBA_SSM_DTYPE", "float32")
 ENV = {
     "SGLANG_USE_AITER": "1",
     "SGLANG_AITER_K3_OPT": "1",
@@ -45,6 +47,8 @@ ARGS = [
     "128",
     "--mamba-full-memory-ratio",
     "0.9",
+    "--mamba-ssm-dtype",
+    SSM_DTYPE,
     "--speculative-algorithm",
     "DSPARK",
     "--speculative-draft-model-path",
